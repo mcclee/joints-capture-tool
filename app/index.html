@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=yes, initial-scale=1, maximum-scale=1">
+    <meta name="mobile-web-app-capable" content="yes">
+    <base target="_blank">
+
+    <title>Skeleton 3d reconstruction</title>
+
+    <script src="js/jquery-3.1.1.min.js"></script>
+    <script src="js/tfjs.js"></script>
+    <script src="js/posenet.js"></script>
+    <script src="js/three.js"></script>
+    <script src="js/OrbitControls.js"></script>
+    <script src="js/GLTFLoader.js"></script>
+    <script src="js/WebGL.js"></script>
+
+    <link href="css/bootstrap.min.css" rel="stylesheet">
+
+    <style>
+        #poseCanvas {
+            -webkit-transform: scaleX(-1);
+            transform: scaleX(-1);
+        }
+    </style>
+</head>
+
+<body>
+<div id="wrapper" class="centered">
+    <div style="position: absolute" id="info"></div>
+
+    <div id="log">
+    </div>
+
+    <div>
+        <div class="col-1 col"></div>
+        <div class="col-10 col">
+            <div class="row" style="margin: 10px">
+                <button class="btn" onclick="startWebcam();">Start WebCam</button>
+                <button style="margin-left: 20px" class="btn" onclick="stopWebcam();">Stop WebCam</button>
+                <button style="margin-left: 20px" class="btn" onclick="startVideo();">Start Video</button>
+                <button style="margin-left: 20px" class="btn" onclick="pauseVideo();">Pause Video</button>
+                <button style="margin-left: 20px" class="btn" onclick="usage();">How to use</button>
+            </div>
+            <div class="row">
+                <div class="col-6">
+                    <div class="video-wrapper local">
+                        <video id="video"
+                               style="position: absolute;width: 300px"
+                               autoplay="true"
+                               playsinline=""></video>
+                        <canvas style="position: absolute;z-index: 1"
+                                id="poseCanvas"></canvas>
+                        <canvas style="display:none;position: absolute;z-index: 0" id="imageCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script type="text/javascript">
+
+    let localStream;                                // web cam
+
+    let networks;                                   // tensorflojs network
+
+    let currentAnimationId;                         // animation id
+
+    let camera, controls, scene, renderer;          // 3d world
+
+    let joints_sample = [];                         // 2d joints will be send to the backend, as the 2nd networks input
+
+    let joints_sample_3d = [];                      // joints received from the backend
+
+    let lines_3d = [];                              // have access to drawn lines to conveniently destroy
+    let sphere_3d = [];
+
+    let modelObjects = {};
+
+    const indexMap2d = {
+        'centerHip': 0,
+        'rightHip': 1,
+        'rightKnee': 2,
+        'rightAnkle': 3,
+        'leftHip': 4,
+        'leftKnee': 5,
+        'leftAnkle': 6,
+        'spine': 7,
+        'centerShoulder': 8,
+        'head': 9,
+        'leftShoulder': 10,
+        'leftElbow': 11,
+        'leftWrist': 12,
+        'rightShoulder': 13,
+        'rightElbow': 14,
+        'rightWrist': 15
+    };
+
+    const indexMap3d = {                            // joints index agreement
+        'leftHip': 0,
+        'leftKnee': 1,
+        'leftAnkle': 2,
+        'rightHip': 3,
+        'rightKnee': 4,
+        'rightAnkle': 5,
+        'centerHip': 6,
+        'spine': 7,
+        'centerShoulder': 8,
+        'head': 9,
+        'rightShoulder': 10,
+        'rightElbow': 11,
+        'rightWrist': 12,
+        'leftShoulder': 13,
+        'leftElbow': 14,
+        'leftWrist': 15
+    };
+
+    const linePairs = [                             // lines that consit a human skeleton
+        ['spine', 'centerHip', 'mixamorigSpine', new THREE.Vector3(0.0, 1.0, 0.0)],                                                         // spineBottom
+        ['centerShoulder', 'spine',],
+        ['centerShoulder', 'head', 'mixamorigHead', new THREE.Vector3(0.0, 1.0, 0.0)],  // mixamorigHeadTop_End
+
+        ['leftShoulder', 'centerShoulder'],
+        ['centerShoulder', 'rightShoulder'],
+        ['leftShoulder', 'leftElbow'],
+        ['leftElbow', 'leftWrist'],
+        ['rightShoulder', 'rightElbow'],//, 'mixamorigRightArm', new THREE.Vector3(1.0, 0.0, 0.0).normalize()],
+        ['rightElbow', 'rightWrist'],//, 'mixamorigRightForeArm', new THREE.Vector3(1.0, 0.0, 0.0).normalize()],
+        ['centerHip', 'leftHip'],
+        ['leftHip', 'leftKnee'],
+        ['leftKnee', 'leftAnkle'],
+        ['leftKnee', 'leftAnkle'],
+        ['centerHip', 'rightHip'],
+        ['rightHip', 'rightKnee'],
+        ['rightKnee', 'rightAnkle'],
+    ];
+
+    // start, end, parent
+    const bones = {
+
+        'mixamorigSpine': {
+            'startJoint': 'centerHip',
+            'endJoint': 'spine',
+            'parent': undefined,
+            'standardQuat': new THREE.Quaternion(), // parent joint vec apply to this quat, we get the standard vec for this joint
+        },
+
+        'mixamorigSpine1': {
+            'startJoint': 'spine',
+            'endJoint': 'centerShoulder',
+            'parent': undefined, //'mixamorigSpine',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigHead': {
+            'startJoint': 'centerShoulder',
+            'endJoint': 'head',
+            'parent': 'mixamorigSpine',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        //
+        'mixamorigSpine2': {
+            'startJoint': 'spine',
+            'endJoint': 'centerShoulder',
+            'parent': undefined,
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        // left arm
+
+        'mixamorigLeftShoulder': {
+            'startJoint': 'centerShoulder',
+            'endJoint': 'leftShoulder',
+            'parent': undefined,
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigLeftArm': {
+            'startJoint': 'leftShoulder',
+            'endJoint': 'leftElbow',
+            'parent': undefined, //'mixamorigLeftShoulder',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigLeftForeArm': {
+            'startJoint': 'leftElbow',
+            'endJoint': 'leftWrist',
+            'parent': undefined, //'mixamorigLeftArm',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        // right arm
+
+        'mixamorigRightShoulder': {
+            'startJoint': 'centerShoulder',
+            'endJoint': 'rightShoulder',
+            'parent': undefined,
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigRightArm': {
+            'startJoint': 'rightShoulder',
+            'endJoint': 'rightElbow',
+            'parent': undefined, //'mixamorigRightShoulder',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigRightForeArm': {
+            'startJoint': 'rightElbow',
+            'endJoint': 'rightWrist',
+            'parent': undefined, //'mixamorigRightArm',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        // left leg
+
+        'mixamorigLeftUpLeg': {
+            'startJoint': 'leftHip',
+            'endJoint': 'leftKnee',
+            'parent': 'mixamorigSpine',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigLeftLeg': {
+            'startJoint': 'leftKnee',
+            'endJoint': 'leftAnkle',
+            'parent': 'mixamorigLeftUpLeg',
+            'standardQuat': new THREE.Quaternion()
+        },
+
+        // right leg
+
+        'mixamorigRightUpLeg': {
+            'startJoint': 'rightHip',
+            'endJoint': 'rightKnee',
+            'parent': 'mixamorigSpine',
+            'standardQuat': new THREE.Quaternion(),
+        },
+
+        'mixamorigRightLeg': {
+            'startJoint': 'rightKnee',
+            'endJoint': 'rightAnkle',
+            'parent': 'mixamorigRightUpLeg',
+            'standardQuat': new THREE.Quaternion()
+        },
+    };
+
+    // let leftArmQuat = new THREE.Quaternion();
+    // leftArmQuat.setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
+    // bones['mixamorigLeftShoulder']['standardQuat'] = leftArmQuat;
+    //
+    // let rightArmQuat = new THREE.Quaternion();
+    // rightArmQuat.setFromAxisAngle(new THREE.Vector3(0, 0, -1), Math.PI / 2);
+    // bones['mixamorigRightShoulder']['standardQuat'] = rightArmQuat;
+    // //
+    let leftLeg = new THREE.Quaternion();
+    leftLeg.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+    bones['mixamorigLeftUpLeg']['standardQuat'] = leftLeg;
+    // //
+    let rightLeg = new THREE.Quaternion();
+    rightLeg.setFromAxisAngle(new THREE.Vector3(-1, 0, 0), Math.PI);
+    bones['mixamorigRightUpLeg']['standardQuat'] = leftLeg;
+
+    const test_2d = [
+        [364.8181427483365, 402.1679788105875], [338.20440824541333, 399.34880934733064], [344.53082121795023, 490.12176557565516], [373.6410429668936, 557.0361463955172], [391.82966110326913, 405.0430750146441], [386.4626973339525, 500.4195000882045], [374.01653877202864, 593.3398592435473], [358.13977851348, 350.0118864821089], [358.7907324161477, 298.41851942261496], [356.36676282021097, 261.20141708412547], [392.61996090914556, 309.95448234980944], [418.73690482967345, 361.07646887251667], [422.34825580311366, 412.7801314594551], [327.5449890806326, 313.2630500417638], [301.8809202378766, 366.08205299059995], [315.0577016074021, 405.44904262852936]
+    ];
+
+    const scaleFactor = 0.50;                       // 2d networks configurations
+    const flipHorizontal = true;
+    const outputStride = 16;
+    const scoreThreshold = 0.58;
+    const input2dWidth = 680;
+
+    let canvasFactor;
+
+    // 2d drawing canvas and webcam element
+    const imageElement = document.getElementById('video');
+    const poseCanvasElement = document.getElementById("poseCanvas");
+    const imageCanvasElement = document.getElementById("imageCanvas");
+
+    const poseContext = poseCanvasElement.getContext("2d");
+    const imageContext = imageCanvasElement.getContext("2d");
+
+    // 2nd part networks are served through backend
+    const server = "ws://localhost:8001";
+    const socket = new WebSocket(server);
+
+    // 2D drawing
+
+    /**
+     * Draw 2d lines on canvas
+     * */
+    function drawLine(_from, _to, color = '#00ff00') {
+        poseContext.beginPath();
+        poseContext.lineWidth = 2;
+        poseContext.strokeStyle = color;
+        poseContext.moveTo(canvasFactor * _from['position'].x, canvasFactor * _from['position'].y);
+        poseContext.lineTo(canvasFactor * _to['position'].x, canvasFactor * _to['position'].y);
+        poseContext.stroke();
+    }
+
+    function drawCircle(pos, color = '#00ff00') {
+        poseContext.beginPath();
+        poseContext.strokeStyle = color;
+        poseContext.arc(canvasFactor * pos['position'].x, canvasFactor * pos['position'].y, 5, 0, 2 * Math.PI);
+        poseContext.stroke();
+    }
+
+    /**
+     *
+     * @param array_2d
+     * @param scale
+     * @returns {*}
+     */
+    function normalize2d(array_2d, scale = 1.0) {
+        let _min = Infinity;
+        let _max = -Infinity;
+
+        for (let i = 0; i < array_2d.length; ++i) {
+            for (let j = 0; j < array_2d[i].length; ++j) {
+                _min = Math.min(_min, array_2d[i][j]);
+                _max = Math.max(_max, array_2d[i][j]);
+            }
+        }
+
+        for (let i = 0; i < array_2d.length; ++i) {
+            for (let j = 0; j < array_2d[i].length; ++j) {
+                array_2d[i][j] = scale * (array_2d[i][j] - _min) / (_max - _min);
+            }
+        }
+
+        return array_2d
+    }
+
+    /**
+     * Use current image element's content to request 2d joints prediction and draw on the canvas
+     * */
+    function updateCanvas() {
+
+        // get canvas data from img
+        imageContext.drawImage(imageElement, 0, 0);
+
+        // console.log(c.toDataURL());
+        networks.estimateSinglePose(imageCanvasElement, scaleFactor, flipHorizontal, outputStride).then(function (result) {
+
+                let joints = {};
+                for (let i = 0; i < result['keypoints'].length; ++i) {
+                    joints[result['keypoints'][i]['part']] = result['keypoints'][i];
+                }
+
+                // joints['nose']['position'].y -= 10;
+                // joints['leftHip']['position'].y -= 20;
+                // joints['rightHip']['position'].y -= 20;
+
+                // calculate center shoulder
+                joints['centerShoulder'] = {
+                    score: (joints['leftShoulder']['score'] + joints['rightShoulder']['score']) * 0.5,
+                    part: 'centerShoulder',
+                    position: {
+                        x: (joints['leftShoulder']['position'].x + joints['rightShoulder']['position'].x) * 0.5,
+                        y: (joints['leftShoulder']['position'].y + joints['rightShoulder']['position'].y) * 0.5
+                    },
+                };
+                joints['centerHip'] = {
+                    score: (joints['leftHip']['score'] + joints['rightHip']['score']) * 0.5,
+                    part: 'centerHip',
+                    position: {
+                        x: (joints['leftHip']['position'].x + joints['rightHip']['position'].x) * 0.5,
+                        y: (joints['leftHip']['position'].y + joints['rightHip']['position'].y) * 0.5,
+                    },
+                };
+                joints['spine'] = {
+                    score: (joints['centerHip']['score'] + joints['centerShoulder']['score']) * 0.5,
+                    part: 'spine',
+                    position: {
+                        x: (joints['centerHip']['position'].x + joints['centerShoulder']['position'].x) * 0.5,
+                        y: (joints['centerHip']['position'].y + joints['centerShoulder']['position'].y) * 0.5,
+                    },
+                };
+
+                joints['head'] = joints['nose'];
+
+
+                // change position manully here
+
+                // joints['head']['position'].y -= 20;
+                // // joints['leftKnee']['position'].y += 60;
+                // // joints['rightKnee']['position'].y += 60;
+                // joints['leftAnkle']['position'].y -= 30;
+                // joints['rightAnkle']['position'].y -= 30;
+
+                poseContext.clearRect(0, 0, poseCanvasElement.width, poseCanvasElement.height);
+
+                let index = 15;
+
+                for (let each in indexMap2d) {
+                    if (joints[each]['score'] > scoreThreshold) {
+                        let color = '#00ff00';
+                        if (indexMap2d[each] == index) {
+                            color = 'red';
+                        }
+                        drawCircle(joints[each], color);
+                    }
+                }
+
+                for (let i = 0; i < linePairs.length; ++i) {
+                    if (joints[linePairs[i][0]]['score'] > scoreThreshold && joints[linePairs[i][1]]['score']) {
+                        drawLine(joints[linePairs[i][0]], joints[linePairs[i][1]]);
+                    }
+                }
+
+                // for (key in joints) {
+                //     if (key in indexMap2d) {
+                //         joints[key]['position'].x = test_2d[indexMap2d[key]][0];
+                //         joints[key]['position'].y = test_2d[indexMap2d[key]][1];
+                //     }
+                // }
+                //
+                // for (let each in indexMap2d) {
+                //     if (joints[each]['score'] > scoreThreshold) {
+                //         let color = '#00ff00';
+                //         if (indexMap2d[each] == index) {
+                //             color = 'red';
+                //         }
+                //         drawCircle(joints[each], color);
+                //     }
+                // }
+                //
+                // for (let i = 0; i < linePairs.length; ++i) {
+                //     if (joints[linePairs[i][0]]['score'] > scoreThreshold && joints[linePairs[i][1]]['score']) {
+                //         drawLine(joints[linePairs[i][0]], joints[linePairs[i][1]]);
+                //     }
+                // }
+
+
+                if (result['score'] > scoreThreshold) {
+                    joints_sample = [];
+                    for (let key in indexMap2d) {
+                        joints_sample.push([joints[key]['position'].x, joints[key]['position'].y]);
+                    }
+                    // console.log(JSON.stringify(joints_sample));
+                    socket.send(joints_sample);
+                }
+            }
+        );
+
+        setTimeout(function () {
+            currentAnimationId = requestAnimationFrame(updateCanvas);
+        }, 100);
+
+    }
+
+    // 3D drawing
+
+    /**
+     * Build joints_sample_3d from the result received from backend, a 48d vector.
+     * joints_sample_3d will be a 16 x 3 2d array
+     */
+    function convertTo3dJoints(result) {
+        for (let i = 0; i < result.length; ++i) {
+            joints_sample_3d[parseInt(i / 3)][i % 3] = result[i];
+        }
+    }
+
+    /**
+     * Draw 3d line in the scene
+     * @param start
+     * @param end
+     * @param color
+     */
+    function setLine(start, end, color = 0x000000) {
+        let material = new THREE.LineBasicMaterial({
+            color: color,
+            linewidth: 10,
+            linecap: 'round', //ignored by WebGLRenderer
+            linejoin: 'round' //ignored by WebGLRenderer
+        });
+        // material.linewidth = 100.0;
+        // material.lights = true;
+        let geometry = new THREE.Geometry();
+        geometry.vertices.push(start);
+        geometry.vertices.push(end);
+        // geometry.vertices.push(new THREE.Vector3(10, 0, 0));
+        let line = new THREE.LineSegments(geometry, material);
+        lines_3d.push(line);
+        scene.add(line);
+    }
+
+    /**
+     * Draw sphere in the scene
+     */
+    function setSphere(position, radius, color = 0xffff00) {
+        var geometry = new THREE.SphereBufferGeometry(radius, 8, 8);
+        var material = new THREE.MeshPhongMaterial({color: color});
+        var sphere = new THREE.Mesh(geometry, material);
+        sphere.position.set(position.x, position.y, position.z);
+        scene.add(sphere);
+        sphere_3d.push(sphere);
+        //
+    }
+
+    let angle = 0.0;
+
+    /**
+     * Based on current content in joints_sample_3d, draw the line pairs in the scene
+     */
+    function updateScene() {
+
+        if ('mixamorigRightForeArm' in modelObjects) {
+
+            for (let this_bone in bones) {
+
+                let parent_bone = bones[this_bone]['parent'];
+
+                if (parent_bone === undefined) {
+                    continue;
+                }
+
+                // first calculate parent normalized vector, and the current bone's normalized vector
+
+                let standardVec = new THREE.Vector3(
+                    joints_sample_3d[indexMap3d[bones[parent_bone]['endJoint']]][0] - joints_sample_3d[indexMap3d[bones[parent_bone]['startJoint']]][0],
+                    joints_sample_3d[indexMap3d[bones[parent_bone]['endJoint']]][1] - joints_sample_3d[indexMap3d[bones[parent_bone]['startJoint']]][1],
+                    joints_sample_3d[indexMap3d[bones[parent_bone]['endJoint']]][2] - joints_sample_3d[indexMap3d[bones[parent_bone]['startJoint']]][2]
+                ).normalize();
+
+                let currentVec = new THREE.Vector3(
+                    joints_sample_3d[indexMap3d[bones[this_bone]['endJoint']]][0] - joints_sample_3d[indexMap3d[bones[this_bone]['startJoint']]][0],
+                    joints_sample_3d[indexMap3d[bones[this_bone]['endJoint']]][1] - joints_sample_3d[indexMap3d[bones[this_bone]['startJoint']]][1],
+                    joints_sample_3d[indexMap3d[bones[this_bone]['endJoint']]][2] - joints_sample_3d[indexMap3d[bones[this_bone]['startJoint']]][2]
+                ).normalize();
+
+                // transform the parent vector to the standard vector
+
+                standardVec.applyQuaternion(bones[this_bone]['standardQuat']);
+
+                // calculate the quaternion between the bone and the standardVec
+
+                let result = bones[this_bone]['initialQuat'].clone();
+
+                let quaternion = new THREE.Quaternion();
+                quaternion.setFromUnitVectors(standardVec, currentVec);
+                result.multiply(quaternion);
+
+                modelObjects[this_bone].setRotationFromQuaternion(result);
+
+                // if (bones[each].length !== 3) continue;
+                // let this_joint = each;
+                // let parent_joint = bones[each][2];
+                //
+                // var quaternion = new THREE.Quaternion(); // create one and reuse it
+                //
+                // let currentVec = new THREE.Vector3(
+                //     joints_sample_3d[indexMap3d[bones[this_joint][1]]][0] - joints_sample_3d[indexMap3d[bones[this_joint][0]]][0],
+                //     joints_sample_3d[indexMap3d[bones[this_joint][1]]][1] - joints_sample_3d[indexMap3d[bones[this_joint][0]]][1],
+                //     joints_sample_3d[indexMap3d[bones[this_joint][1]]][2] - joints_sample_3d[indexMap3d[bones[this_joint][0]]][2]
+                // ).normalize();
+                //
+                // let initialVec = new THREE.Vector3(
+                //     joints_sample_3d[indexMap3d[bones[parent_joint][1]]][0] - joints_sample_3d[indexMap3d[bones[parent_joint][0]]][0],
+                //     joints_sample_3d[indexMap3d[bones[parent_joint][1]]][1] - joints_sample_3d[indexMap3d[bones[parent_joint][0]]][1],
+                //     joints_sample_3d[indexMap3d[bones[parent_joint][1]]][2] - joints_sample_3d[indexMap3d[bones[parent_joint][0]]][2]
+                // ).normalize()
+                //
+                // quaternion.setFromUnitVectors(currentVec, initialVec);
+                // modelObjects[each].setRotationFromQuaternion(quaternion);
+            }
+
+            // modelObjects['mixamorigHips'].setRotationFromEuler(new THREE.Euler(angle, 0, 0, 'XYZ'));
+            // modelObjects['mixamorigRightForeArm'].setRotationFromEuler(new THREE.Euler(angle, 0, 0, 'XYZ'));
+            // modelObjects['mixamorigSpine'].setRotationFromEuler(new THREE.Euler(angle, angle, 0, 'XYZ')); // centerHip
+            // angle += 0.01;
+        }
+
+        if (joints_sample_3d.length > 0 && (joints_sample_3d[0][0] !== 0) || (joints_sample_3d[0][1] !== 0) || (joints_sample_3d[0][2] !== 0)) {
+            for (let i = 0; i < lines_3d.length; ++i) {
+                scene.remove(lines_3d[i]);
+                lines_3d[i].geometry.dispose();
+                lines_3d[i].material.dispose();
+            }
+            lines_3d = [];
+
+            for (let i = 0; i < sphere_3d.length; ++i) {
+                scene.remove(sphere_3d[i]);
+                sphere_3d[i].geometry.dispose();
+                sphere_3d[i].material.dispose();
+            }
+            sphere_3d = [];
+
+            for (let i = 0; i < linePairs.length; ++i) {
+                setLine(generateVec3(indexMap3d[linePairs[i][0]]), generateVec3(indexMap3d[linePairs[i][1]]));
+            }
+
+            for (let each in indexMap3d) {
+                setSphere(generateVec3(indexMap3d[each]), 5, 'gray');
+            }
+        }
+    }
+
+    /**
+     *
+     * @param joint_index
+     * @param x_offset
+     * @param y_offset
+     * @param z_offset
+     * @returns {Vector3}
+     */
+    function generateVec3(joint_index, x_offset = 0, y_offset = 200, z_offset = 0) {
+        let world_coordinate = new THREE.Vector3(0.2 * joints_sample_3d[joint_index][0] + x_offset, -0.2 * joints_sample_3d[joint_index][1] + y_offset, 0.2 * joints_sample_3d[joint_index][2] + z_offset);
+        world_coordinate.applyAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 8);
+        return world_coordinate;
+    }
+
+    // infrastructures
+
+    /**
+     * Alert messages for usage
+     */
+    function usage() {
+        alert(
+            "1. Start server srcipt src/run_webcam.py \n" +
+            "2. Refresh this page \n"
+        );
+    }
+
+    /**
+     * Open camera, while set up the 1st part network
+     */
+    function startWebcam() {
+        if (navigator.getUserMedia) {
+            navigator.getUserMedia(
+                {video: true, audio: false, video: {width: input2dWidth}},
+                stream => {
+                    localStream = stream;
+                    document.getElementById('video').srcObject = stream;
+                    // $('.local video').attr('src', URL.createObjectURL(stream));
+                    // load the posenet model
+                    posenet.load().then(function (net) {
+                        // posenet model loaded
+                        networks = net;
+
+                        setTimeout(function () {
+                            imageContext.canvas.width = imageElement.videoWidth;
+                            imageContext.canvas.height = imageElement.videoHeight;
+                            canvasFactor = 300.0 / imageElement.videoWidth;
+                            poseContext.canvas.width = 300;
+                            poseContext.canvas.height = 300.0 * imageElement.videoHeight / imageElement.videoWidth;
+                            updateCanvas();
+                        }, 1000);
+                    });
+                },
+                error => {
+                    alert('error while accessing usermedia ' + error.toString());
+                }
+            );
+        } else {
+            console.log("getUserMedia not supported");
+        }
+    }
+
+    function pauseVideo() {
+        imageElement.pause();
+    }
+
+    function startVideo() {
+
+        posenet.load().then(function (net) {
+            // posenet model loaded
+            networks = net;
+            // video
+            // imageElement.src = "sample.mp4";
+            // imageElement.src = "sample2.mov";
+            imageElement.src = "dancing.mp4";
+            imageElement.load();
+
+            setTimeout(function () {
+                imageContext.canvas.width = imageElement.videoWidth;
+                imageContext.canvas.height = imageElement.videoHeight;
+                canvasFactor = 300.0 / imageElement.videoWidth;
+                poseContext.canvas.width = 300;
+                poseContext.canvas.height = 300.0 * imageElement.videoHeight / imageElement.videoWidth;
+                updateCanvas();
+            }, 1000);
+
+        });
+    }
+
+    /**
+     * Stop camera
+     */
+    function stopWebcam() {
+        try {
+            localStream.stop();
+        } catch (e) {
+            console.log(e);
+            if (localStream) {
+                localStream.getTracks().forEach(function (track) {
+                    track.stop();
+                });
+            }
+        }
+        localStream = undefined;
+    }
+
+    /**
+     * Things start here
+     */
+    function init() {
+
+        for (let i = 0; i < 16; ++i) {
+            joints_sample_3d.push([0.0, 0.0, 0.0]);
+        }
+
+        // connect to backend service
+
+        socket.onerror = function (error) {
+            alert("Socket server " + server + " is not opening!!");
+        };
+
+        socket.addEventListener('open', function (event) {
+            socket.send('Hi service.');
+        });
+
+        socket.addEventListener('message', function (event) {
+            let result;
+            try {
+                result = JSON.parse(event.data);
+            } catch (e) {
+                console.log("received message format", e);
+                return;
+            }
+            convertTo3dJoints(result);
+        });
+
+        // set up 3d scene
+
+        if (WEBGL.isWebGLAvailable() === false) {
+            document.getElementById("info").appendChild(WEBGL.getWebGLErrorMessage());
+        }
+
+        scene = new THREE.Scene();
+
+        // sky
+        scene.background = new THREE.Color(0x87ceeb);
+        scene.fog = new THREE.FogExp2(0xcccccc, 0.0002);
+
+        renderer = new THREE.WebGLRenderer({antialias: true});
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.gammaOutput = true;
+        renderer.gammaFactor = 2.2;
+        renderer.shadowMap.enabled = true;
+
+        document.getElementById("info").appendChild(renderer.domElement);
+
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 5000);
+        camera.position.set(400, 200, 0);
+
+        // controls
+
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+        // controls.enableDamping = true; // an animation loop is required when either damping or auto-rotation are enabled
+        // controls.dampingFactor = 0.25;
+
+        controls.screenSpacePanning = false;
+
+        controls.minDistance = 0;
+        controls.maxDistance = 2000;
+
+        controls.maxPolarAngle = Math.PI / 2;
+
+        // world
+
+        let axesHelper = new THREE.AxesHelper(1100);
+        scene.add(axesHelper);
+
+        // ground
+        let mesh = new THREE.Mesh(new THREE.PlaneBufferGeometry(2000, 2000), new THREE.MeshPhongMaterial({
+            color: 0x666666,
+            depthWrite: false
+        }));
+        mesh.rotation.x = -Math.PI / 2;
+        scene.add(mesh);
+
+        let grid = new THREE.GridHelper(2000, 100, 0x000000, 0x000000);
+        grid.material.opacity = 0.2;
+        grid.material.transparent = true;
+        scene.add(grid);
+
+        // lights
+
+        let hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444);
+        hemiLight.position.set(0, 200, 0);
+        scene.add(hemiLight);
+
+        let dirLight = new THREE.DirectionalLight(0xffffff);
+        dirLight.position.set(-30, 100, -100);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 2;
+        dirLight.shadow.camera.bottom = -2;
+        dirLight.shadow.camera.left = -2;
+        dirLight.shadow.camera.right = 2;
+        dirLight.shadow.camera.near = 0.1;
+        dirLight.shadow.camera.far = 40;
+        scene.add(dirLight);
+
+        // soilder
+
+        // var loader = new THREE.GLTFLoader();
+        // loader.load('models/Soldier.glb', function (gltf) {
+        //
+        //     model = gltf.scene;
+        //     model.scale.set(50, 50, 50);
+        //     scene.add(model);
+        //
+        //     model.traverse(function (object) {
+        //         modelObjects[object.name] = object;
+        //         if (object.name in bones) {
+        //             bones[object.name]['initialQuat'] = object['quaternion'].clone();
+        //         }
+        //         console.log(object);
+        //     });
+        //
+        //     skeleton = new THREE.SkeletonHelper(model);
+        //     scene.add(skeleton);
+        //
+        // });
+
+        window.addEventListener('resize', onWindowResize, false);
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+        updateScene()
+        requestAnimationFrame(animate);
+        render();
+    }
+
+    function render() {
+        renderer.render(scene, camera);
+    }
+
+
+    let model_init_rotation
+
+    /**
+     *
+     */
+    function modelPartRotate(name) {
+
+    }
+
+    init();
+    animate();
+</script>
+</body>
+</html>
